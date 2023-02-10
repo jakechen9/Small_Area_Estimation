@@ -1,0 +1,214 @@
+---
+title: "Model fitting"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r}
+library("emdi")
+library("tidyverse")
+library("readxl")
+library("sp")
+```
+
+
+# Introduction
+# In this small area estimation project, we are going to use "emdi" package to explore the relationship between county poverty levels in United States and poverty indicators, such as, population, income level, etc. Our primary interest is estimating these reginally disaggregated indicators. Further more, we implemented COVID-19 dataset from "New York Times" to add additional auxiliary information to our model. 
+
+
+# Import Data Set
+
+# In this project, we use Small Area Income and Poverty Estimates (SAIPE) from Census Bureau, along with county COVID-19 cases and deaths data from "New York Times"
+
+
+```{r}
+# Import COVID-19 data and Poverty Estimate data
+us.counties <- read.csv("~/Desktop/Research/covid-19-data-master/us-counties.csv")
+df <- read.csv("~/Desktop/Research/SAIPESNC_07MAR21_17_42_11_59.csv")
+
+
+
+# Summarize number of COVID-19 Cases and Deaths for model implementation
+covid_df <- us.counties %>%
+      group_by(county,fips) %>% 
+      summarize(cases = max(cases),
+                deaths = max(deaths)
+                )
+```
+
+
+# However, the datasets were not as ideal as we expected. Therefore, we need some data manipulation for the model fitting process.
+
+
+```{r}
+# Data manipulation
+df1 <- df %>%
+
+
+# Select the auxiliary information that we are going to use.
+  select(County.ID,                         # County.ID 
+         State...County.Name,               # County Name
+         All.Ages.SAIPE.Poverty.Universe,   # Population
+         All.Ages.in.Poverty.Percent,       # Poverty Rate for all ages
+         All.Ages.in.Poverty.Percent.LB.90.,# 90% lower bound of poverty rate for all ages
+         All.Ages.in.Poverty.Percent.UB.90. # 90% upper bound of poverty rate for all ages
+         ) %>%
+
+
+# Rename "Poverty Universe" and "County.ID" for combining the datasets 
+  rename(total_population = All.Ages.SAIPE.Poverty.Universe) %>% 
+  rename(fips = County.ID) %>% 
+
+
+# Calculate the variance of the direct estimator and added to the data set
+  mutate(
+    var_dir = ((df$All.Ages.in.Poverty.Percent.UB.90.-
+                  df$All.Ages.in.Poverty.Percent)^2)/((1.645)^2))
+
+
+# Use inner_join to combine the two data frames
+combined_df <- df1 %>% inner_join(covid_df, by = "fips") 
+
+
+# Unfortunately, the "population" variable in our dataset is not numeric. In order to generate trustworthy results, we need to calculate the case rate and death rate in each county for our auxiliary information.
+
+
+# Fix chracter string that are not properly formatted and change them into numeric
+combined_df$total_population <- gsub(",", "", combined_df$total_population) 
+combined_df$total_population <- as.numeric(combined_df$total_population)
+
+
+# Calculate death rate and percentage of cases in each county and added to the data frame
+combined_data <- combined_df %>% 
+               mutate(caserate = cases/total_population) %>% 
+               mutate(deathrate = deaths/cases)
+
+
+# Drop missing values in the auxiliary variables
+combine_data <- na.omit(combined_data)
+
+
+# Get top and bottom 52 values for model fitting
+d1 <- combine_data %>% 
+  arrange(desc(All.Ages.in.Poverty.Percent)) %>% 
+  filter( All.Ages.in.Poverty.Percent < 5.5 | All.Ages.in.Poverty.Percent > 31.0)
+ 
+```
+
+
+# Methodology and Models
+
+# In this project, we are going to use standard Fay-Herriot model (FH) for our fitting process. The logic behind the FH model is that it links area-level direct estimators that are based on survey data (COVID-19 data) to covariates aggregated on an area level that stem from administrative data (SAIPE). 
+
+# The model is composed of two levels. 
+
+# The sampling level: θiˆDir = θi + ei, θˆDir is an unbiased direct estimator for a population indicator of interest θi. In our case, θˆDir is the poverty percentage for all ages. 
+
+# The second level, θi = xi ⊤ β + ui, links the target indicator θi linearly to area-specific covariates xi, which is the auxiliary information provided by COVID-19 data. β is a vector of unknown fixed-effect parameters and ui is an independent and identically normally distributed random effect.
+
+# The combination of the sampling and the linking model is θˆDir = xi ⊤ β + ui + ei. Since we have calculated the variance for our direct estimator through 90% confidence interval in the previous data manipulation section, we now can fit our model using the "fh()" function from package "emdi".
+
+# Additionally, we will be using three different methods, which are maximum likelihood ("ml"), adjusted restricted maximum likelihood ("amrl") and robustified maximum likelihood with robust eblup prediction ("reblup") in the function argument to explore results.
+                                 
+
+```{r}
+# Model fitting with (method = "ml", "amrl", "reblup")
+
+# Fit fh model with "ml" method 
+
+fh_std <- fh(fixed = All.Ages.in.Poverty.Percent ~ caserate + deathrate + total_population, vardir = "var_dir", combined_data = d1, domains = "State...County.Name", method = "ml", MSE = TRUE)
+summary(fh_std)
+```
+
+```{r}
+fh_std1 <- fh(fixed = All.Ages.in.Poverty.Percent ~ deathrate + caserate, vardir = "var_dir", combined_data = d1, domains = "State...County.Name", method = "ml", MSE = TRUE)
+summary(fh_std1)
+```
+
+
+# From the summary part, all of the auxiliary variables are significant even on a small significance level and their explanatory power is large with an adjusted R^2 of around 0,65. However, it is difficult to tell whether case rate or death rate is more significant. So, we fit the same model with only case rate and death rate to compare the difference. According to the p-value, it seems that death rate is the most significant variable among all other variables. The results of the Shapiro-Wilk-test indicate that normality is not rejected for both errors.
+
+
+```{r}
+# Plot 
+plot(fh_std)
+```
+
+# From the normal quantile-quantile plot and kernel densities distribution plot, we can see that random effect's performance is better
+
+```{r}
+#compare plot
+compare_plot(fh_std)
+```
+
+```{r}
+#compare
+compare(fh_std)
+```
+
+```{r}
+# Extract Results
+head(estimators(fh_std, CV = TRUE))
+```
+
+
+```{r}
+# Fit fh model with "amrl" method 
+fh_std2 <- fh(fixed = All.Ages.in.Poverty.Percent ~ caserate + deathrate + total_population, vardir = "var_dir", combined_data = d1, domains = "State...County.Name", method = "amrl", MSE = TRUE)
+summary(fh_std2)
+```
+
+# From the above p-value, we can tell that all auxiliary information are significant and death rate is still the most important auxiliary variable in this case.
+
+```{r}
+# Plot 
+plot(fh_std2)
+```
+
+
+```{r}
+#compare plot
+compare_plot(fh_std2)
+```
+
+```{r}
+#compare
+compare(fh_std2)
+```
+
+```{r}
+# Extract Results for "amrl" method
+head(estimators(fh_std2, CV = TRUE))
+```
+
+
+```{r}
+# Fit fh model with "reblup" method 
+fh_std3 <- fh(fixed = All.Ages.in.Poverty.Percent ~ caserate + deathrate + total_population, vardir = "var_dir", combined_data = d1, domains = "State...County.Name", method = "reblup", k = 1.345, c = 1, MSE = TRUE, mse_type = "boot")
+summary(fh_std3)
+```
+
+```{r}
+# Plot 
+plot(fh_std3)
+```
+
+```{r}
+#compare plot
+compare_plot(fh_std3)
+```
+
+
+```{r}
+#compare
+compare(fh_std3)
+```
+
+```{r}
+# Extract Results for "reblup" method
+head(estimators(fh_std3, CV = TRUE))
+```
+
+# Interpretation and Conclusion
+# Through fitting the combined data into fh model via three different methods, we can see that COVID-19 death rate is the most significant auxiliary variable among the others. According to the output plots, the random effects fit well, but the realized residuals' performence was not very ideal. Hypothetically speaking, it could be the reason that we did not count "n" when calculating the variance for our direct estimators. Therefore, in the future studies, we hope that we could apply a different distribution for our model.
